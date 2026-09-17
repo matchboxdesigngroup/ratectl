@@ -70,6 +70,39 @@ overrides `AR_LEVEL`:
 Only a recognised level name is accepted from `extra_args`; anything else is
 ignored and the default stands.
 
+## Stateful handshake
+
+Wazuh's [custom AR protocol](https://documentation.wazuh.com/current/user-manual/capabilities/active-response/custom-active-response-scripts.html)
+defines a `check_keys` handshake for stateful responses. On `add` (and only via
+the stdin protocol, not legacy argv) the script writes:
+
+```json
+{"version":1,"origin":{"name":"nginx-ratelimit-ar","module":"active-response"},"command":"check_keys","parameters":{"keys":["nginx-ratelimit"]}}
+```
+
+and reads back `continue` or `abort`. The key is the constant `nginx-ratelimit`,
+not a per-source value: this response is global -- one escalation at a time --
+unlike `firewall-drop`, which keys on the offending `srcip`.
+
+Two deliberate deviations from the obvious implementation:
+
+**`abort` is checked against reality.** If execd says the response is already
+active, the script reads the actual level first. Already at the target, it logs
+`SKIP` and exits 0. Not at the target -- a missed `delete`, or somebody ran
+`nginx-ratelimit set off` by hand -- execd's bookkeeping is stale, and refusing
+would leave the site unprotected, so it logs `OVERRIDE` and applies anyway.
+
+**No reply is not fatal.** An older execd that never answers leaves the script
+waiting up to 10s, after which it logs and proceeds. The worst case is a
+redundant `set`, which `nginx-ratelimit` no-ops.
+
+Set `AR_HANDSHAKE=0` to skip the handshake entirely.
+
+The protocol is newline-delimited in both directions, so the script reads
+exactly one line rather than slurping stdin -- execd holds the pipe open
+awaiting the handshake, and reading to EOF stalls every invocation for the full
+read timeout.
+
 ## Behaviour worth knowing
 
 **Alert storms are cheap.** Repeated `add` while already at the target level is

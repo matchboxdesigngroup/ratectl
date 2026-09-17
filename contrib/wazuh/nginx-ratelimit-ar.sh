@@ -26,6 +26,8 @@
 #   AR_LEVEL          level to set on `add`     (default: strict)
 #   AR_RESTORE_LEVEL  level to set on `delete`  (default: off)
 #   AR_LOCK_WAIT      seconds to wait on a concurrent run (default: 30)
+#   AR_KEY            check_keys handshake key (default: nginx-ratelimit)
+#   AR_HANDSHAKE      1 to perform the stateful handshake, 0 to skip (default: 1)
 #   NGINX_RATELIMIT_BIN, AR_LOG, AR_LOCK
 #
 # IMPORTANT: if the site normally runs with limiting on, set
@@ -45,6 +47,11 @@ AR_LOCK="${AR_LOCK:-/var/run/nginx-ratelimit-ar.lock}"
 # How long to wait for a concurrent invocation to finish before giving up.
 # Keep it well under the manager's active-response timeout.
 AR_LOCK_WAIT="${AR_LOCK_WAIT:-30}"
+# The stateful check_keys handshake. Our action is global -- one escalation at
+# a time -- so the key is a constant rather than a per-source value the way
+# firewall-drop keys on srcip.
+AR_KEY="${AR_KEY:-nginx-ratelimit}"
+AR_HANDSHAKE="${AR_HANDSHAKE:-1}"
 NGINX_RATELIMIT_BIN="${NGINX_RATELIMIT_BIN:-/usr/local/sbin/nginx-ratelimit}"
 
 PROG="nginx-ratelimit-ar"
@@ -59,6 +66,40 @@ die() {
     exit 1
 }
 
+read_line() {
+    # One line from stdin, or empty on timeout. The protocol is newline
+    # delimited in both directions.
+    timeout "${1:-5}" head -n 1 2>/dev/null || true
+}
+
+json_field() {
+    # $1 = json, $2 = top-level key
+    printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get(sys.argv[1], ""))
+except Exception:
+    print("")
+' "$2" 2>/dev/null
+}
+
+check_keys() {
+    # Stateful handshake: announce our key, then honour execd's verdict.
+    # Returns 0 to proceed, 1 if execd says this response is already active.
+    printf '{"version":1,"origin":{"name":"%s","module":"active-response"},"command":"check_keys","parameters":{"keys":["%s"]}}\n' \
+        "$PROG" "$AR_KEY"
+
+    REPLY=$(read_line 10)
+    if [ -z "$REPLY" ]; then
+        # Older execd, or a manual invocation. Proceeding is the safe default:
+        # the worst case is a redundant set, which nginx-ratelimit no-ops.
+        log "handshake: no reply from execd, proceeding"
+        return 0
+    fi
+    [ "$(json_field "$REPLY" command)" = "abort" ] && return 1
+    return 0
+}
+
 # --------------------------------------------------------------------------
 # Work out what we were asked to do.
 #
@@ -69,17 +110,20 @@ COMMAND=""
 EXTRA=""
 SRCIP=""
 RULE=""
+STDIN_MODE=0
 
 if [ $# -gt 0 ] && { [ "$1" = "add" ] || [ "$1" = "delete" ]; }; then
     COMMAND="$1"
     SRCIP="${3:-}"
     RULE="${5:-}"
 else
-    # Read stdin if there is any. The timeout keeps a manual invocation with no
-    # input from hanging forever.
+    # Read exactly one line. `cat` would block until EOF, and for a stateful
+    # response execd holds the pipe open waiting for our handshake -- slurping
+    # stdin stalls every invocation for the full timeout. dash has no `read -t`,
+    # hence `timeout ... head -n 1`.
     INPUT=""
     if [ ! -t 0 ]; then
-        INPUT=$(timeout 5 cat 2>/dev/null || true)
+        INPUT=$(read_line 5)
     fi
 
     if [ -n "$INPUT" ]; then
@@ -102,6 +146,7 @@ print((a.get("data") or {}).get("srcip", ""))
 print((a.get("rule") or {}).get("id", ""))
 ' 2>/dev/null) || die "could not parse the active-response JSON on stdin"
 
+        STDIN_MODE=1
         COMMAND=$(printf '%s' "$PARSED" | sed -n 1p)
         EXTRA=$(printf '%s' "$PARSED" | sed -n 2p)
         SRCIP=$(printf '%s' "$PARSED" | sed -n 3p)
@@ -156,15 +201,33 @@ fi
 # up processes. Whoever holds the lock is already applying a level, so a
 # concurrent caller has nothing useful to add.
 # --------------------------------------------------------------------------
+CONTEXT="command=$COMMAND level=$TARGET"
+[ -n "$SRCIP" ] && CONTEXT="$CONTEXT srcip=$SRCIP"
+[ -n "$RULE" ] && CONTEXT="$CONTEXT rule=$RULE"
+
 run_tool() {
     # No --force: the reload interval exists to stop rapid reloads accumulating
     # shutting-down workers, and an alert storm is exactly that case.
     "$NGINX_RATELIMIT_BIN" --quiet set "$TARGET" 2>&1
 }
 
-CONTEXT="command=$COMMAND level=$TARGET"
-[ -n "$SRCIP" ] && CONTEXT="$CONTEXT srcip=$SRCIP"
-[ -n "$RULE" ] && CONTEXT="$CONTEXT rule=$RULE"
+if [ "$COMMAND" = "add" ] && [ "$STDIN_MODE" -eq 1 ] && [ "$AR_HANDSHAKE" = "1" ]; then
+    if ! check_keys; then
+        # execd believes this response is already active. Trust the real system
+        # state over its bookkeeping: if the level really is applied, we are
+        # genuinely redundant; if it is not, execd is stale (a missed delete, a
+        # manual `set off`) and refusing would leave us unprotected.
+        CURRENT=$("$NGINX_RATELIMIT_BIN" --json status 2>/dev/null \
+            | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["level"])
+except Exception: print("")' 2>/dev/null)
+        if [ "$CURRENT" = "$TARGET" ]; then
+            log "SKIP $CONTEXT -- execd reports it active and the level is already $TARGET"
+            exit 0
+        fi
+        log "OVERRIDE $CONTEXT -- execd reports it active but the level is '${CURRENT:-unknown}'; applying anyway"
+    fi
+fi
 
 if command -v flock >/dev/null 2>&1; then
     OUTPUT=$(flock -w "$AR_LOCK_WAIT" 9 || exit 99; run_tool) 9>"$AR_LOCK"
