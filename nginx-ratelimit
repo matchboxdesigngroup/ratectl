@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+"""nginx-ratelimit -- manage nginx rate limiting as a set of named levels.
+
+Python 3 standard library only. See README.md for design notes.
+"""
+
+import argparse
+import datetime
+import difflib
+import errno
+import fcntl
+import fnmatch
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+# --------------------------------------------------------------------------
+# Paths and tunables. Every one is overridable by environment variable so the
+# test suite can exercise the real code paths without root and without
+# touching the system's nginx.
+# --------------------------------------------------------------------------
+
+def _env(name, default):
+    return os.environ.get(name, default)
+
+CONF_PATH = _env("NGINX_RATELIMIT_CONF", "/etc/nginx/conf.d/nginx-ratelimit.conf")
+STATE_DIR = _env("NGINX_RATELIMIT_STATE_DIR", "/var/lib/nginx-ratelimit")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
+LOCK_PATH = os.path.join(STATE_DIR, "lock")
+NGINX_BIN = _env("NGINX_RATELIMIT_NGINX_BIN", "nginx")
+# Extra arguments prepended to every nginx invocation (e.g. "-c ... -p ...").
+# Lets the integration suite drive a private, unprivileged nginx instance.
+NGINX_ARGS = shlex.split(_env("NGINX_RATELIMIT_NGINX_ARGS", ""))
+# Test-only escape hatch. This bypasses a friendly guard, not a permission:
+# the kernel still enforces write access to /etc/nginx either way.
+SKIP_ROOT_CHECK = _env("NGINX_RATELIMIT_SKIP_ROOT_CHECK", "") == "1"
+ACCESS_LOG = _env("NGINX_RATELIMIT_ACCESS_LOG", "/var/log/nginx/access.log")
+ERROR_LOG = _env("NGINX_RATELIMIT_ERROR_LOG", "/var/log/nginx/error.log")
+
+BACKUP_KEEP = 20
+DEFAULT_RELOAD_INTERVAL = float(_env("NGINX_RATELIMIT_RELOAD_INTERVAL", "10"))
+
+# Constraint 1: name and size are byte-identical across every level, forever.
+# nginx preserves a shared memory zone across a reload only when these are
+# unchanged; if they change the zone is reinitialised and every client's
+# accumulated request state is discarded.
+#
+# The *key expression* is part of that invariant too -- nginx refuses the
+# reload outright with
+#   [emerg] limit_req "perip" uses the "$x" key while previously it used "$y"
+# and, critically, `nginx -t` does NOT catch it (a fresh process has no prior
+# zone to compare against). Holding the key at the indirect `$rl_key` is what
+# lets the whitelist change without ever touching the key expression.
+ZONE_NAME = "perip"
+ZONE_SIZE = "10m"
+ZONE_KEY = "$rl_key"
+
+# `limit_req_zone` requires a rate= parameter even when nothing references the
+# zone, so `off` still needs one to keep the zone declared and alive. The value
+# is arbitrary and unused; it is fixed so the generated file stays deterministic.
+OFF_PLACEHOLDER_RATE = "10r/s"
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_VALIDATION = 2
+EXIT_NOT_ROOT = 3
+EXIT_NO_NGINX = 4
+
+
+class Level:
+    __slots__ = ("name", "rate", "burst", "nodelay", "intent")
+
+    def __init__(self, name, rate, burst, nodelay, intent):
+        self.name = name
+        self.rate = rate
+        self.burst = burst
+        self.nodelay = nodelay
+        self.intent = intent
+
+    @property
+    def enforcing(self):
+        return self.rate is not None
+
+    @property
+    def zone_rate(self):
+        return self.rate if self.rate is not None else OFF_PLACEHOLDER_RATE
+
+
+# Ordered loosest -> strictest. `off` participates in the ordering, so `down`
+# from `relaxed` lands on `off`.
+LEVELS = [
+    Level("off",      None,    None, False, "Zone declared, no limit_req emitted"),
+    Level("relaxed",  "30r/s", 60,   True,  "Barely-there backstop"),
+    Level("normal",   "10r/s", 20,   True,  "Default steady state"),
+    Level("strict",   "3r/s",  10,   True,  "Elevated pressure"),
+    Level("lockdown", "1r/s",  2,    False, "Queue rather than reject; last resort"),
+]
+LEVEL_NAMES = [lv.name for lv in LEVELS]
+LEVEL_BY_NAME = {lv.name: lv for lv in LEVELS}
+
+
+class ToolError(Exception):
+    """Fatal, user-facing error carrying an exit code."""
+
+    def __init__(self, message, code=EXIT_USAGE, detail=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.detail = detail
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+class Out:
+    def __init__(self, json_mode=False, quiet=False):
+        self.json_mode = json_mode
+        self.quiet = quiet
+
+    def say(self, text):
+        if not self.json_mode and not self.quiet:
+            print(text)
+
+    def warn(self, text):
+        if not self.json_mode:
+            print(text, file=sys.stderr)
+
+    def emit(self, payload):
+        if self.json_mode:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    if not text:
+        return None
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Config generation
+# --------------------------------------------------------------------------
+
+HEADER_RE = re.compile(r"^#\s*level:\s*(\S+)\s+generated:\s*(\S+)\s*$", re.M)
+GEO_ENTRY_RE = re.compile(r"^\s{4}(\S+)\s+1;\s*$", re.M)
+
+
+def normalise_cidr(text):
+    """Return a canonical CIDR string, or raise ToolError."""
+    try:
+        net = ipaddress.ip_network(text.strip(), strict=False)
+    except ValueError as exc:
+        raise ToolError("not a valid IP or CIDR: %s (%s)" % (text, exc), EXIT_USAGE)
+    return str(net)
+
+
+def sort_whitelist(entries):
+    """Deterministic order: IPv4 before IPv6, then by network address."""
+    def key(item):
+        net = ipaddress.ip_network(item, strict=False)
+        return (net.version, int(net.network_address), net.prefixlen)
+    return sorted(set(entries), key=key)
+
+
+def generate_config(level, whitelist, generated_at=None):
+    """Render the complete managed config file."""
+    generated_at = generated_at or utcnow()
+    lines = []
+    lines.append("# Managed by nginx-ratelimit. Do not edit by hand.")
+    lines.append("# level: %-8s generated: %s" % (level.name, iso(generated_at)))
+    lines.append("")
+
+    # The geo/map pair is always emitted, even with an empty whitelist, so the
+    # file shape is stable across levels and diffs stay small.
+    lines.append("geo $rl_exempt {")
+    lines.append("    default 0;")
+    for cidr in sort_whitelist(whitelist):
+        lines.append("    %s 1;" % cidr)
+    lines.append("}")
+    lines.append("")
+    lines.append("map $rl_exempt $rl_key {")
+    lines.append("    0 $binary_remote_addr;")
+    lines.append('    1 "";          # empty key is exempt from limiting')
+    lines.append("}")
+    lines.append("")
+    lines.append(
+        "limit_req_zone %s zone=%s:%s rate=%s;"
+        % (ZONE_KEY, ZONE_NAME, ZONE_SIZE, level.zone_rate)
+    )
+    if level.enforcing:
+        directive = "limit_req zone=%s burst=%d" % (ZONE_NAME, level.burst)
+        if level.nodelay:
+            directive += " nodelay"
+        lines.append(directive + ";")
+    else:
+        # Zone stays declared so the shared memory survives the transition and
+        # re-enabling does not reset client state. Verified: nginx emits no
+        # warning for a declared-but-unused zone.
+        lines.append("# level off: zone kept alive, no limit_req emitted.")
+    lines.append("limit_req_status 429;")
+    lines.append("limit_req_log_level warn;")
+    return "\n".join(lines) + "\n"
+
+
+def mask_generated(text):
+    """Blank the generated: timestamp so two renderings compare equal."""
+    return HEADER_RE.sub(lambda m: "# level: %s generated: -" % m.group(1), text)
+
+
+def same_config(a, b):
+    return mask_generated(a) == mask_generated(b)
+
+
+def parse_config(text):
+    """Recover (level_name, whitelist) from a generated config. Best effort."""
+    level_name = None
+    match = HEADER_RE.search(text or "")
+    if match and match.group(1) in LEVEL_BY_NAME:
+        level_name = match.group(1)
+
+    whitelist = []
+    geo = re.search(r"geo \$rl_exempt \{(.*?)\n\}", text or "", re.S)
+    if geo:
+        for entry in GEO_ENTRY_RE.findall(geo.group(1)):
+            try:
+                whitelist.append(str(ipaddress.ip_network(entry, strict=False)))
+            except ValueError:
+                continue
+    return level_name, whitelist
+
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+def default_state():
+    return {
+        "level": None,
+        "last_change": None,
+        "last_reload": None,
+        # Second-resolution ISO is what `status` shows, but the reload
+        # interval needs sub-second accuracy or it under-waits by up to 1s.
+        "last_reload_epoch": None,
+        "whitelist": [],
+        "pinned": False,
+        "reload_count": 0,
+    }
+
+
+def read_config_text():
+    try:
+        with open(CONF_PATH, "r") as handle:
+            return handle.read()
+    except IOError as exc:
+        if exc.errno in (errno.ENOENT, errno.EACCES):
+            return None
+        raise
+
+
+def load_state():
+    """Load state.json, recovering from the generated config when needed.
+
+    State is a cache. It is never allowed to be the reason the tool fails:
+    a missing or corrupt file falls back to parsing the `# level:` comment.
+    """
+    state = default_state()
+    recovered = False
+    raw = None
+    try:
+        with open(STATE_PATH, "r") as handle:
+            raw = json.load(handle)
+    except (IOError, OSError, ValueError):
+        raw = None
+
+    if isinstance(raw, dict):
+        for key in state:
+            if key in raw:
+                state[key] = raw[key]
+    else:
+        recovered = True
+
+    if state["level"] not in LEVEL_NAMES:
+        recovered = True
+        state["level"] = None
+
+    if not isinstance(state["whitelist"], list):
+        recovered = True
+        state["whitelist"] = []
+    if not isinstance(state["reload_count"], int) or state["reload_count"] < 0:
+        state["reload_count"] = 0
+    if not isinstance(state.get("last_reload_epoch"), (int, float)):
+        state["last_reload_epoch"] = None
+    state["pinned"] = bool(state["pinned"])
+
+    if recovered:
+        conf_level, conf_whitelist = parse_config(read_config_text())
+        if conf_level:
+            state["level"] = conf_level
+            state["whitelist"] = conf_whitelist
+        else:
+            # Nothing managed yet, and nothing to recover from.
+            state["level"] = "off"
+            state["whitelist"] = []
+
+    clean = []
+    for entry in state["whitelist"]:
+        try:
+            clean.append(str(ipaddress.ip_network(str(entry), strict=False)))
+        except ValueError:
+            continue
+    state["whitelist"] = sort_whitelist(clean)
+    state["_recovered"] = recovered
+    return state
+
+
+def save_state(state):
+    ensure_dirs()
+    payload = {k: v for k, v in state.items() if not k.startswith("_")}
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def ensure_dirs():
+    for path in (STATE_DIR, BACKUP_DIR):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("cannot create %s: %s" % (path, exc), EXIT_USAGE)
+
+
+# --------------------------------------------------------------------------
+# nginx interaction
+# --------------------------------------------------------------------------
+
+def run(cmd, timeout=30):
+    """Run a command, returning (returncode, combined output)."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise ToolError(
+            "nginx not found (looked for %r). Is nginx installed?" % cmd[0],
+            EXIT_NO_NGINX,
+        )
+    except subprocess.TimeoutExpired:
+        raise ToolError("%s timed out after %ss" % (" ".join(cmd), timeout), EXIT_NO_NGINX)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def nginx_cmd(*args):
+    """Build an nginx command line honouring NGINX_RATELIMIT_NGINX_ARGS."""
+    return [NGINX_BIN] + NGINX_ARGS + list(args)
+
+
+def nginx_available():
+    return shutil.which(NGINX_BIN) is not None or os.path.isfile(NGINX_BIN)
+
+
+def nginx_test():
+    """Run `nginx -t` against the real, live configuration."""
+    return run(nginx_cmd("-t"))
+
+
+def nginx_dump():
+    return run(nginx_cmd("-T"))
+
+
+def nginx_reload():
+    return run(nginx_cmd("-s", "reload"))
+
+
+def nginx_running():
+    """True if a master process is alive.
+
+    `nginx -s reload` needs a pid file and a live master; distinguishing
+    "not installed" from "not running" gives a better error than a raw
+    failure from the signal.
+    """
+    code, _ = run(["pgrep", "-x", "-f", "nginx: master process.*"], timeout=10)
+    if code == 0:
+        return True
+    try:
+        code, out = run(["ps", "-eo", "cmd"], timeout=10)
+    except ToolError:
+        return False
+    return code == 0 and "nginx: master process" in out
+
+
+def validate_standalone(candidate_text):
+    """Syntax-check the candidate in a synthetic http context.
+
+    Used by --dry-run, which must change nothing: the real conf.d file is
+    never touched. This validates everything we generate, but by construction
+    cannot see interactions with the rest of the server's configuration --
+    the authoritative check is the write/validate/rollback cycle in commit().
+    """
+    tmpdir = tempfile.mkdtemp(prefix="nginx-ratelimit-check.")
+    try:
+        candidate = os.path.join(tmpdir, "candidate.conf")
+        with open(candidate, "w") as handle:
+            handle.write(candidate_text)
+        wrapper = os.path.join(tmpdir, "nginx.conf")
+        with open(wrapper, "w") as handle:
+            handle.write(
+                "daemon off;\n"
+                "pid %(d)s/nginx.pid;\n"
+                "error_log %(d)s/error.log emerg;\n"
+                "events { worker_connections 64; }\n"
+                "http {\n"
+                "    access_log off;\n"
+                "    client_body_temp_path %(d)s/cbt;\n"
+                "    proxy_temp_path %(d)s/pt;\n"
+                "    fastcgi_temp_path %(d)s/ft;\n"
+                "    uwsgi_temp_path %(d)s/ut;\n"
+                "    scgi_temp_path %(d)s/st;\n"
+                "    include %(c)s;\n"
+                # No server block: `nginx -t` binds listen sockets for real, so
+                # a synthetic listener would either need a privileged port or
+                # risk colliding with something already bound.
+                "}\n" % {"d": tmpdir, "c": candidate}
+            )
+        return run([NGINX_BIN, "-t", "-c", wrapper, "-p", tmpdir,
+                    "-e", os.path.join(tmpdir, "error.log")])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def conflicting_zone_declarations():
+    """Other files in conf.d that declare our zone name.
+
+    nginx refuses to start on a duplicate zone name, so a stray hand-written
+    file is worth surfacing before we hand nginx a config it will reject.
+    """
+    conf_dir = os.path.dirname(CONF_PATH)
+    hits = []
+    pattern = re.compile(r"zone=%s\s*:" % re.escape(ZONE_NAME))
+    try:
+        names = sorted(os.listdir(conf_dir))
+    except OSError:
+        return hits
+    for name in names:
+        path = os.path.join(conf_dir, name)
+        if path == CONF_PATH or not name.endswith(".conf"):
+            continue
+        try:
+            with open(path, "r") as handle:
+                body = handle.read()
+        except (IOError, OSError):
+            continue
+        if "limit_req_zone" in body and pattern.search(body):
+            hits.append(path)
+    return hits
+
+
+# --------------------------------------------------------------------------
+# Backups and the validate-then-commit cycle
+# --------------------------------------------------------------------------
+
+def backup_existing():
+    """Copy the current config aside. Returns the backup path, or None."""
+    if not os.path.isfile(CONF_PATH):
+        return None
+    ensure_dirs()
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(BACKUP_DIR, "%s.conf" % stamp)
+    suffix = 1
+    while os.path.exists(path):
+        path = os.path.join(BACKUP_DIR, "%s-%d.conf" % (stamp, suffix))
+        suffix += 1
+    shutil.copy2(CONF_PATH, path)
+    return path
+
+
+def prune_backups(keep=BACKUP_KEEP):
+    try:
+        names = [n for n in os.listdir(BACKUP_DIR) if n.endswith(".conf")]
+    except OSError:
+        return []
+    names.sort(reverse=True)
+    removed = []
+    for name in names[keep:]:
+        try:
+            os.unlink(os.path.join(BACKUP_DIR, name))
+            removed.append(name)
+        except OSError:
+            continue
+    return removed
+
+
+def write_atomic(path, text):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".nginx-ratelimit.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def restore(backup):
+    """Put the previous file back (or remove ours if there was none).
+
+    Re-runs `nginx -t` so the caller can confirm the restore is itself good.
+    """
+    if backup is None:
+        try:
+            os.unlink(CONF_PATH)
+        except OSError:
+            pass
+    else:
+        shutil.copy2(backup, CONF_PATH)
+    return nginx_test()
+
+
+def commit(candidate_text, out):
+    """Back up, write, validate, and roll back on failure.
+
+    A failed `nginx -t` must never reach a reload, and the filesystem must be
+    left exactly as it was found.
+    """
+    backup = backup_existing()
+    write_atomic(CONF_PATH, candidate_text)
+    code, output = nginx_test()
+    if code == 0:
+        prune_backups()
+        return output, backup
+
+    recheck_code, recheck_output = restore(backup)
+    detail = {
+        "nginx_t": output.strip(),
+        "rolled_back_to": backup,
+        "restore_verified": recheck_code == 0,
+        "restore_nginx_t": recheck_output.strip(),
+    }
+    if recheck_code != 0:
+        raise ToolError(
+            "nginx -t failed and the restored configuration ALSO fails nginx -t. "
+            "nginx was not reloaded; the running workers are unaffected, but "
+            "%s needs manual attention." % CONF_PATH,
+            EXIT_VALIDATION,
+            detail,
+        )
+    raise ToolError(
+        "nginx -t rejected the generated configuration; rolled back, not reloaded.",
+        EXIT_VALIDATION,
+        detail,
+    )
+
+
+def nginx_prefix():
+    """The prefix nginx resolves relative include paths against."""
+    for i, arg in enumerate(NGINX_ARGS):
+        if arg == "-p" and i + 1 < len(NGINX_ARGS):
+            return NGINX_ARGS[i + 1]
+        if arg.startswith("-p") and len(arg) > 2:
+            return arg[2:]
+    code, version_output = run(nginx_cmd("-V"))
+    match = re.search(r"--prefix=(\S+)", version_output or "")
+    return match.group(1) if match else "/etc/nginx"
+
+
+def main_config_path(dump_text):
+    """The main nginx.conf, as the running configuration reports it."""
+    for i, arg in enumerate(NGINX_ARGS):
+        if arg == "-c" and i + 1 < len(NGINX_ARGS):
+            return NGINX_ARGS[i + 1]
+    match = re.search(r"^# configuration file (\S+?):", dump_text or "", re.M)
+    return match.group(1) if match else os.path.join(nginx_prefix(), "nginx.conf")
+
+
+def include_covers(dump_text, target):
+    """Does any include directive anywhere in the config glob to `target`?
+
+    Walks every include in the dump, so an include nested inside another
+    included file counts just as much as one in nginx.conf itself.
+    """
+    prefix = nginx_prefix()
+    for match in re.finditer(r"^\s*include\s+([^;]+);", dump_text or "", re.M):
+        pattern = match.group(1).strip().strip("\"'")
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(prefix, pattern)
+        if fnmatch.fnmatch(target, pattern):
+            return True
+    return False
+
+
+def find_http_insert_point(text):
+    """Offset just inside the main `http {` block, or None.
+
+    A deliberately small scanner rather than a regex: it tracks brace depth
+    and skips comments and quoted strings, which is enough to locate one
+    top-level block and nowhere near enough to justify parsing config in
+    general. Anything more than this belongs to crossplane in phase 3.
+    """
+    depth = 0
+    index = 0
+    token = ""
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "#":
+            while index < length and text[index] != "\n":
+                index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            while index < length and text[index] != quote:
+                index += 2 if text[index] == "\\" else 1
+            index += 1
+            token = ""
+            continue
+        if char == "{":
+            if depth == 0 and token.split()[-1:] == ["http"]:
+                return index + 1
+            depth += 1
+            token = ""
+        elif char == "}":
+            depth -= 1
+            token = ""
+        elif char == ";":
+            token = ""
+        else:
+            token += char
+        index += 1
+    return None
+
+
+def config_was_read(dump_text):
+    """Did nginx actually read our file? True / False / None if we cannot tell.
+
+    `nginx -T` lists every file it read as a `# configuration file <path>`
+    header. Called after the candidate is on disk, so absence is conclusive:
+    nginx re-read the whole tree and did not pick our file up.
+    """
+    if not dump_text:
+        return None
+    return ("# configuration file %s" % CONF_PATH) in dump_text
+
+
+class Lock:
+    """Advisory lock so two concurrent runs cannot interleave write+validate."""
+
+    def __init__(self, path=LOCK_PATH):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self):
+        try:
+            ensure_dirs()
+            self.handle = open(self.path, "w")
+            fcntl.flock(self.handle, fcntl.LOCK_EX)
+        except (IOError, OSError, ToolError):
+            self.handle = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle, fcntl.LOCK_UN)
+                self.handle.close()
+            except (IOError, OSError):
+                pass
+        return False
+
+
+def wait_for_reload_window(state, interval, force, out):
+    """Sleep out the remainder of the minimum reload interval.
+
+    Old workers persist until their connections close, so rapid reloads pile
+    up shutting-down processes. We wait *before* writing, so the config write
+    and the reload stay back-to-back and the on-disk file never sits in a
+    state the running nginx has not been told about.
+    """
+    if force or interval <= 0:
+        return 0.0
+    epoch = state.get("last_reload_epoch")
+    if isinstance(epoch, (int, float)):
+        elapsed = time.time() - float(epoch)
+    else:
+        last = parse_iso(state.get("last_reload"))
+        if last is None:
+            return 0.0
+        elapsed = (utcnow() - last).total_seconds()
+    if elapsed < 0:
+        return 0.0
+    remaining = interval - elapsed
+    if remaining <= 0:
+        return 0.0
+    remaining = min(remaining, interval)
+    out.say("Waiting %.1fs for the minimum reload interval (%gs). "
+            "Use --force to skip." % (remaining, interval))
+    time.sleep(remaining)
+    return remaining
+
+
+# --------------------------------------------------------------------------
+# The apply path, shared by set/up/down/off/allow/deny
+# --------------------------------------------------------------------------
+
+def require_root():
+    if os.geteuid() != 0 and not SKIP_ROOT_CHECK:
+        raise ToolError(
+            "must run as root: this writes to %s and reloads nginx." % CONF_PATH,
+            EXIT_NOT_ROOT,
+        )
+
+
+def require_nginx():
+    if not nginx_available():
+        raise ToolError(
+            "nginx not found on PATH (%s). Install it, or set "
+            "NGINX_RATELIMIT_NGINX_BIN." % NGINX_BIN,
+            EXIT_NO_NGINX,
+        )
+
+
+def apply_change(args, out, level, whitelist, action):
+    """Generate, diff, validate, commit and reload. The single mutation path."""
+    require_nginx()
+    state = load_state()
+    current_text = read_config_text() or ""
+    candidate = generate_config(level, whitelist)
+
+    diff = "".join(
+        difflib.unified_diff(
+            current_text.splitlines(keepends=True),
+            candidate.splitlines(keepends=True),
+            fromfile=CONF_PATH + " (current)",
+            tofile=CONF_PATH + " (candidate)",
+        )
+    )
+
+    payload = {
+        "action": action,
+        "level": level.name,
+        "rate": level.rate,
+        "burst": level.burst,
+        "nodelay": level.nodelay,
+        "whitelist": sort_whitelist(whitelist),
+        "changed": False,
+        "reloaded": False,
+        "dry_run": bool(args.dry_run),
+        "diff": diff,
+    }
+
+    # Idempotency: we always rewrite the whole file rather than appending, so a
+    # repeat run renders byte-identical content (modulo the generated: stamp).
+    if current_text and same_config(current_text, candidate):
+        payload["reason"] = "already active"
+        out.say("Already at level %s; nothing to do." % level.name)
+        # Keep the state cache honest even when the file needed no change.
+        if not args.dry_run and (os.geteuid() == 0 or SKIP_ROOT_CHECK):
+            state["level"] = level.name
+            state["whitelist"] = sort_whitelist(whitelist)
+            try:
+                save_state(state)
+            except ToolError:
+                pass
+        out.emit(payload)
+        return EXIT_OK
+
+    if args.dry_run:
+        code, output = validate_standalone(candidate)
+        conflicts = conflicting_zone_declarations()
+        payload["nginx_t_exit"] = code
+        payload["nginx_t"] = output.strip()
+        payload["validated"] = code == 0
+        payload["zone_conflicts"] = conflicts
+        out.say(diff if diff else "(no change)")
+        out.say("")
+        out.say("nginx -t (candidate, standalone): %s"
+                % ("ok" if code == 0 else "FAILED"))
+        for line in output.strip().splitlines():
+            out.say("  " + line)
+        if conflicts:
+            out.say("")
+            out.say("WARNING: zone %r is also declared in: %s"
+                    % (ZONE_NAME, ", ".join(conflicts)))
+        out.say("")
+        out.say("Dry run: nothing was written and nginx was not reloaded.")
+        out.emit(payload)
+        return EXIT_OK if code == 0 else EXIT_VALIDATION
+
+    require_root()
+
+    if not nginx_running():
+        raise ToolError(
+            "nginx does not appear to be running; refusing to change the "
+            "configuration when the reload cannot be delivered.",
+            EXIT_NO_NGINX,
+        )
+
+    with Lock():
+        waited = wait_for_reload_window(state, args.reload_interval, args.force, out)
+        test_output, backup = commit(candidate, out)
+
+        # `nginx -t` passing only means the file is valid -- not that nginx
+        # reads it. With no `include .../conf.d/*.conf;` in the http block the
+        # file is inert, and without this guard we would reload happily and
+        # report a level that limits nothing.
+        dump_code, dump_text = nginx_dump()
+        included = config_was_read(dump_text if dump_code == 0 else "")
+        if included is False:
+            restore(backup)
+            raise ToolError(
+                "%s is not read by the running nginx, so this level would "
+                "limit nothing. Add `include %s/*.conf;` inside the http block "
+                "of nginx.conf, then retry. Nothing was changed."
+                % (CONF_PATH, os.path.dirname(CONF_PATH)),
+                EXIT_NO_NGINX,
+            )
+        payload["config_included"] = included
+        payload["changed"] = True
+        payload["waited_seconds"] = round(waited, 2)
+        payload["nginx_t"] = test_output.strip()
+
+        code, reload_output = nginx_reload()
+        now = utcnow()
+        if code != 0:
+            # `nginx -t` passed but the live master refused the reload. The
+            # zone-key invariant is exactly this case, and -t cannot see it.
+            payload["reload_error"] = reload_output.strip()
+            raise ToolError(
+                "nginx -t passed but `nginx -s reload` failed. The new config "
+                "is on disk at %s; the running workers still have the previous "
+                "one." % CONF_PATH,
+                EXIT_VALIDATION,
+                {"reload_output": reload_output.strip()},
+            )
+
+        state["level"] = level.name
+        state["whitelist"] = sort_whitelist(whitelist)
+        state["last_change"] = iso(now)
+        state["last_reload"] = iso(now)
+        state["last_reload_epoch"] = time.time()
+        state["reload_count"] = int(state.get("reload_count") or 0) + 1
+        save_state(state)
+
+    payload["reloaded"] = True
+    payload["reload_count"] = state["reload_count"]
+    if level.enforcing:
+        out.say("Level %s: rate=%s burst=%d%s. Reloaded."
+                % (level.name, level.rate, level.burst,
+                   " nodelay" if level.nodelay else ""))
+    else:
+        out.say("Level off: zone kept declared, no limit_req. Reloaded.")
+    out.emit(payload)
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_levels(args, out):
+    rows = []
+    for lv in LEVELS:
+        rows.append({
+            "level": lv.name,
+            "rate": lv.rate,
+            "burst": lv.burst,
+            "nodelay": lv.nodelay,
+            "intent": lv.intent,
+        })
+    out.say("%-10s %-7s %-6s %-8s %s"
+            % ("LEVEL", "RATE", "BURST", "NODELAY", "INTENT"))
+    for lv in LEVELS:
+        out.say("%-10s %-7s %-6s %-8s %s" % (
+            lv.name,
+            lv.rate or "-",
+            lv.burst if lv.burst is not None else "-",
+            ("yes" if lv.nodelay else "no") if lv.enforcing else "-",
+            lv.intent,
+        ))
+    out.emit({"levels": rows, "order": LEVEL_NAMES})
+    return EXIT_OK
+
+
+def cmd_status(args, out):
+    state = load_state()
+    level = LEVEL_BY_NAME[state["level"]]
+    conf_text = read_config_text()
+    conf_level, conf_whitelist = parse_config(conf_text)
+    drift = None
+    if conf_text is None:
+        drift = "config file %s is missing" % CONF_PATH
+    elif conf_level != state["level"]:
+        drift = ("state says %s but %s says %s"
+                 % (state["level"], CONF_PATH, conf_level))
+
+    payload = {
+        "level": level.name,
+        "rate": level.rate,
+        "burst": level.burst,
+        "nodelay": level.nodelay,
+        "last_change": state["last_change"],
+        "last_reload": state["last_reload"],
+        "reload_count": state["reload_count"],
+        "whitelist": state["whitelist"],
+        "pinned": state["pinned"],
+        "config_path": CONF_PATH,
+        "config_present": conf_text is not None,
+        "state_recovered": state["_recovered"],
+        "drift": drift,
+    }
+    out.say("level:        %s" % level.name)
+    if level.enforcing:
+        out.say("rate/burst:   %s / %d%s"
+                % (level.rate, level.burst, " nodelay" if level.nodelay else ""))
+    else:
+        out.say("rate/burst:   - (zone declared, not enforcing)")
+    out.say("last change:  %s" % (state["last_change"] or "unknown"))
+    out.say("last reload:  %s" % (state["last_reload"] or "unknown"))
+    out.say("reloads:      %d" % state["reload_count"])
+    out.say("whitelist:    %s" % (", ".join(state["whitelist"]) or "(empty)"))
+    out.say("pinned:       %s" % ("yes" if state["pinned"] else "no"))
+    if state["_recovered"]:
+        out.say("note:         state cache was missing or corrupt; "
+                "recovered from %s" % CONF_PATH)
+    if drift:
+        out.say("WARNING:      %s" % drift)
+    out.emit(payload)
+    return EXIT_OK
+
+
+def cmd_set(args, out):
+    name = args.level
+    if name not in LEVEL_BY_NAME:
+        raise ToolError(
+            "unknown level %r. Known levels: %s" % (name, ", ".join(LEVEL_NAMES)),
+            EXIT_USAGE,
+        )
+    state = load_state()
+    return apply_change(args, out, LEVEL_BY_NAME[name], state["whitelist"], "set")
+
+
+def _step(args, out, delta, action):
+    state = load_state()
+    index = LEVEL_NAMES.index(state["level"])
+    target = index + delta
+    if target < 0 or target >= len(LEVELS):
+        edge = LEVELS[index]
+        out.say("Already at %s (%s of the ordering); nothing to do."
+                % (edge.name, "loosest" if delta < 0 else "strictest"))
+        out.emit({"action": action, "level": edge.name, "changed": False,
+                  "reason": "at end of ordering"})
+        return EXIT_OK
+    return apply_change(args, out, LEVELS[target], state["whitelist"], action)
+
+
+def cmd_up(args, out):
+    return _step(args, out, +1, "up")
+
+
+def cmd_down(args, out):
+    return _step(args, out, -1, "down")
+
+
+def cmd_off(args, out):
+    state = load_state()
+    return apply_change(args, out, LEVEL_BY_NAME["off"], state["whitelist"], "off")
+
+
+def cmd_allow(args, out):
+    cidr = normalise_cidr(args.cidr)
+    state = load_state()
+    whitelist = sort_whitelist(list(state["whitelist"]) + [cidr])
+    return apply_change(args, out, LEVEL_BY_NAME[state["level"]], whitelist, "allow")
+
+
+def cmd_deny(args, out):
+    cidr = normalise_cidr(args.cidr)
+    state = load_state()
+    if cidr not in state["whitelist"]:
+        out.say("%s is not in the whitelist; nothing to do." % cidr)
+        out.emit({"action": "deny", "cidr": cidr, "changed": False,
+                  "whitelist": state["whitelist"], "reason": "not present"})
+        return EXIT_OK
+    whitelist = [c for c in state["whitelist"] if c != cidr]
+    return apply_change(args, out, LEVEL_BY_NAME[state["level"]], whitelist, "deny")
+
+
+# --------------------------------------------------------------------------
+# check -- diagnostics that catch silent misconfiguration
+# --------------------------------------------------------------------------
+
+STATES_PER_MB = 16000
+ACCESS_LOG_SCAN_LINES = 50000
+
+ERROR_LOG_TS = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})")
+LIMIT_LINE = re.compile(r"limiting requests.*zone \"([^\"]+)\"")
+COMBINED_IP = re.compile(r"^(\S+)")
+
+
+def tail_lines(path, limit):
+    """Read up to `limit` trailing lines without loading the whole file."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise IOError(str(exc))
+    block = 65536
+    data = b""
+    with open(path, "rb") as handle:
+        pos = size
+        while pos > 0 and data.count(b"\n") <= limit:
+            step = min(block, pos)
+            pos -= step
+            handle.seek(pos)
+            data = handle.read(step) + data
+    text = data.decode("utf-8", "replace")
+    lines = text.splitlines()
+    return lines[-limit:]
+
+
+def zone_capacity():
+    match = re.match(r"^(\d+)([km]?)$", ZONE_SIZE, re.I)
+    if not match:
+        return None
+    value = int(match.group(1))
+    unit = match.group(2).lower()
+    megabytes = value if unit == "m" else (value / 1024.0 if unit == "k" else
+                                           value / (1024.0 * 1024.0))
+    return int(megabytes * STATES_PER_MB)
+
+
+def check_proxy(dump_text, findings, dump_ok=True):
+    has_real_ip_from = "set_real_ip_from" in (dump_text or "")
+    has_real_ip_header = "real_ip_header" in (dump_text or "")
+    logs_xff = "$http_x_forwarded_for" in (dump_text or "")
+    logs_proxy_add = "$proxy_add_x_forwarded_for" in (dump_text or "")
+
+    xff_seen = None
+    if logs_xff:
+        try:
+            lines = tail_lines(ACCESS_LOG, 2000)
+            xff_seen = False
+            for line in lines:
+                # combined-with-XFF puts it in a quoted field; a bare "-" means absent
+                if re.search(r'"(?:\d{1,3}\.){3}\d{1,3}(?:, ?\S+)*"', line):
+                    xff_seen = True
+                    break
+        except (IOError, OSError):
+            xff_seen = None
+
+    if not dump_ok:
+        findings.append(("warn", "real_ip",
+                         "Could not read the running configuration, so proxy "
+                         "detection was skipped. Re-run as root. If nginx sits "
+                         "behind Cloudflare or a load balancer without "
+                         "set_real_ip_from/real_ip_header, $binary_remote_addr "
+                         "is the proxy's address and every client behind it "
+                         "shares one rate-limit bucket."))
+        return
+
+    if has_real_ip_from and has_real_ip_header:
+        findings.append(("ok", "real_ip",
+                         "set_real_ip_from and real_ip_header are configured; "
+                         "$binary_remote_addr should be the true client."))
+        return
+
+    if xff_seen:
+        findings.append(("fail", "real_ip",
+                         "X-Forwarded-For is present in recent access log entries "
+                         "but set_real_ip_from/real_ip_header are NOT configured. "
+                         "$binary_remote_addr is the proxy's address, so every "
+                         "client behind it shares one rate-limit bucket -- this "
+                         "will rate-limit the entire internet as a single client."))
+    elif logs_xff or logs_proxy_add:
+        findings.append(("warn", "real_ip",
+                         "The log format references X-Forwarded-For but no XFF "
+                         "values were seen recently, and real_ip is not "
+                         "configured. If traffic starts arriving via a proxy or "
+                         "CDN, limiting will collapse onto one bucket."))
+    else:
+        findings.append(("warn", "real_ip",
+                         "Cannot tell whether traffic arrives via a proxy: the "
+                         "access log format does not capture X-Forwarded-For and "
+                         "real_ip is not configured. If nginx sits behind "
+                         "Cloudflare or a load balancer, configure "
+                         "set_real_ip_from/real_ip_header before relying on "
+                         "per-IP limits."))
+
+
+def cmd_setup(args, out):
+    """Add `include <conf.d>/*.conf;` to nginx.conf if nothing covers it.
+
+    This is the one place the tool edits a file it did not generate, which is
+    why it is an explicit subcommand rather than something `set` does on your
+    behalf. Same discipline as every other write: back up, edit, `nginx -t`,
+    restore on failure. nginx is never reloaded -- adding the include only
+    matters once a level is set, and `set` reloads anyway.
+    """
+    require_nginx()
+    conf_dir = os.path.dirname(CONF_PATH)
+    include_line = "include %s/*.conf;" % conf_dir
+
+    dump_code, dump_text = nginx_dump()
+    if dump_code != 0:
+        raise ToolError(
+            "cannot read the running configuration (nginx -T exited %d); "
+            "refusing to edit nginx.conf without knowing what it already "
+            "contains." % dump_code,
+            EXIT_NO_NGINX,
+            {"nginx_T": (dump_text or "").strip()[-2000:]},
+        )
+
+    main_conf = main_config_path(dump_text)
+    payload = {"action": "setup", "nginx_conf": main_conf,
+               "include": include_line, "changed": False,
+               "dry_run": bool(args.dry_run)}
+
+    if config_was_read(dump_text) or include_covers(dump_text, CONF_PATH):
+        out.say("%s is already included by the running configuration; "
+                "nothing to do." % conf_dir)
+        payload["reason"] = "already included"
+        out.emit(payload)
+        return EXIT_OK
+
+    try:
+        with open(main_conf, "r") as handle:
+            original = handle.read()
+    except (IOError, OSError) as exc:
+        raise ToolError("cannot read %s: %s" % (main_conf, exc), EXIT_USAGE)
+
+    point = find_http_insert_point(original)
+    if point is None:
+        raise ToolError(
+            "could not find a top-level `http { ... }` block in %s. Add "
+            "`%s` inside it by hand." % (main_conf, include_line),
+            EXIT_USAGE,
+        )
+
+    candidate = (original[:point]
+                 + "\n    # Added by nginx-ratelimit setup.\n    "
+                 + include_line + "\n"
+                 + original[point:])
+    diff = "".join(difflib.unified_diff(
+        original.splitlines(keepends=True),
+        candidate.splitlines(keepends=True),
+        fromfile=main_conf + " (current)",
+        tofile=main_conf + " (candidate)",
+    ))
+    payload["diff"] = diff
+
+    if args.dry_run:
+        out.say(diff)
+        out.say("Dry run: %s was not modified." % main_conf)
+        out.emit(payload)
+        return EXIT_OK
+
+    require_root()
+    ensure_dirs()
+    try:
+        os.makedirs(conf_dir, exist_ok=True)
+    except OSError as exc:
+        raise ToolError("cannot create %s: %s" % (conf_dir, exc), EXIT_USAGE)
+
+    with Lock():
+        stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+        backup = os.path.join(BACKUP_DIR, "nginx.conf.%s" % stamp)
+        shutil.copy2(main_conf, backup)
+        write_atomic(main_conf, candidate)
+
+        code, output = nginx_test()
+        if code != 0:
+            shutil.copy2(backup, main_conf)
+            recheck_code, recheck_output = nginx_test()
+            raise ToolError(
+                "adding the include made nginx -t fail; %s restored from %s."
+                % (main_conf, backup),
+                EXIT_VALIDATION,
+                {"nginx_t": output.strip(),
+                 "restore_verified": recheck_code == 0,
+                 "restore_nginx_t": recheck_output.strip()},
+            )
+
+    payload["changed"] = True
+    payload["backup"] = backup
+    payload["nginx_t"] = output.strip()
+    out.say(diff)
+    out.say("Added the include to %s (backup: %s)." % (main_conf, backup))
+    out.say("nginx -t passes. nginx was not reloaded; run "
+            "`nginx-ratelimit set <level>` to apply a level.")
+    out.emit(payload)
+    return EXIT_OK
+
+
+def cmd_check(args, out):
+    findings = []
+    details = {}
+
+    if not nginx_available():
+        raise ToolError("nginx not found on PATH (%s)." % NGINX_BIN, EXIT_NO_NGINX)
+    findings.append(("ok", "installed", "nginx binary found."))
+
+    running = nginx_running()
+    findings.append(("ok" if running else "warn", "running",
+                     "nginx master process is running." if running else
+                     "No nginx master process found; level changes cannot reload."))
+
+    code, version_output = run(nginx_cmd("-V"))
+    details["nginx_version"] = version_output.strip().splitlines()[0] if version_output else ""
+    if "--without-http_limit_req_module" in version_output:
+        findings.append(("fail", "module",
+                         "This nginx was built --without-http_limit_req_module; "
+                         "limit_req is unavailable."))
+    else:
+        findings.append(("ok", "module",
+                         "limit_req module is available (not excluded at build time)."))
+
+    dump_code, dump_text = nginx_dump()
+    if dump_code != 0:
+        findings.append(("warn", "conf.d",
+                         "Could not dump the running configuration (nginx -T "
+                         "exited %d); skipping include and proxy checks." % dump_code))
+        dump_text = ""
+        dump_ok = False
+    else:
+        dump_ok = True
+        marker = "# configuration file %s" % CONF_PATH
+        if marker in dump_text:
+            findings.append(("ok", "conf.d",
+                             "%s is included by the running configuration." % CONF_PATH))
+        elif os.path.isfile(CONF_PATH):
+            findings.append(("fail", "conf.d",
+                             "%s exists but is NOT included by the running "
+                             "configuration. Check for `include "
+                             "/etc/nginx/conf.d/*.conf;` inside the http block."
+                             % CONF_PATH))
+        else:
+            findings.append(("warn", "conf.d",
+                             "%s does not exist yet; nothing is being managed."
+                             % CONF_PATH))
+
+    check_proxy(dump_text, findings, dump_ok)
+
+    capacity = zone_capacity()
+    details["zone_capacity"] = capacity
+    unique = None
+    try:
+        lines = tail_lines(ACCESS_LOG, ACCESS_LOG_SCAN_LINES)
+        addrs = set()
+        for line in lines:
+            match = COMBINED_IP.match(line)
+            if match and match.group(1) not in ("-", ""):
+                addrs.add(match.group(1))
+        unique = len(addrs)
+        details["unique_clients_sampled"] = unique
+        details["access_log_lines_sampled"] = len(lines)
+    except (IOError, OSError) as exc:
+        findings.append(("warn", "zone",
+                         "Cannot read %s (%s); skipping zone headroom estimate."
+                         % (ACCESS_LOG, exc)))
+
+    if unique is not None and capacity:
+        ratio = unique / float(capacity)
+        message = ("zone %s:%s holds roughly %d client states; %d unique clients "
+                   "in the last %d log lines (%.1f%% of capacity)."
+                   % (ZONE_NAME, ZONE_SIZE, capacity, unique,
+                      details.get("access_log_lines_sampled", 0), ratio * 100))
+        if ratio >= 0.8:
+            findings.append(("fail", "zone", message +
+                             " At capacity nginx evicts the least recently used "
+                             "states, so limits become unreliable."))
+        elif ratio >= 0.5:
+            findings.append(("warn", "zone", message + " Consider a larger zone -- "
+                             "but note that changing the size resets every "
+                             "client's state on reload."))
+        else:
+            findings.append(("ok", "zone", message))
+
+    # 429s in the last hour, from the error log rather than the access log:
+    # limit_req logs a "limiting requests" line at the configured level.
+    rejected = 0
+    delayed = 0
+    try:
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=1)
+        for line in tail_lines(ERROR_LOG, ACCESS_LOG_SCAN_LINES):
+            match = LIMIT_LINE.search(line)
+            if not match or match.group(1) != ZONE_NAME:
+                continue
+            stamp = ERROR_LOG_TS.match(line)
+            if stamp:
+                try:
+                    when = datetime.datetime.strptime(stamp.group(1), "%Y/%m/%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if when < cutoff:
+                    continue
+            if "delaying request" in line:
+                delayed += 1
+            else:
+                rejected += 1
+        details["rejected_last_hour"] = rejected
+        details["delayed_last_hour"] = delayed
+        findings.append(("ok", "429s",
+                         "Last hour on zone %r: %d requests rejected (429), "
+                         "%d delayed." % (ZONE_NAME, rejected, delayed)))
+    except (IOError, OSError) as exc:
+        findings.append(("warn", "429s",
+                         "Cannot read %s (%s); skipping 429 counts."
+                         % (ERROR_LOG, exc)))
+
+    conflicts = conflicting_zone_declarations()
+    if conflicts:
+        findings.append(("fail", "zone-conflict",
+                         "Zone %r is also declared in: %s. nginx refuses to "
+                         "start on a duplicate zone name."
+                         % (ZONE_NAME, ", ".join(conflicts))))
+
+    labels = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}
+    for status, name, message in findings:
+        out.say("[%s] %-13s %s" % (labels[status], name, message))
+
+    worst = EXIT_OK
+    if any(f[0] == "fail" for f in findings):
+        worst = EXIT_VALIDATION
+    out.emit({
+        "findings": [{"status": s, "check": n, "message": m} for s, n, m in findings],
+        "details": details,
+        "ok": worst == EXIT_OK,
+    })
+    return worst
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+class Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error; 2 is our "rolled back" code."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
+def build_parser():
+    parser = Parser(
+        prog="nginx-ratelimit",
+        description="Manage nginx rate limiting as a set of named levels.",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the unified diff and the nginx -t result; change nothing")
+    parser.add_argument("--quiet", action="store_true", help="suppress human-readable output")
+    parser.add_argument("--json", dest="json_mode", action="store_true",
+                        help="machine-readable output")
+    parser.add_argument("--force", action="store_true",
+                        help="bypass the minimum reload interval")
+    parser.add_argument("--reload-interval", type=float, default=DEFAULT_RELOAD_INTERVAL,
+                        metavar="SECONDS",
+                        help="minimum seconds between reloads (default: %(default)s)")
+
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("status", help="current level, rate/burst, last change, reload count")
+    p_set = sub.add_parser("set", help="jump directly to a level")
+    p_set.add_argument("level", choices=LEVEL_NAMES, metavar="LEVEL")
+    sub.add_parser("up", help="one level stricter")
+    sub.add_parser("down", help="one level looser")
+    sub.add_parser("off", help="alias for `set off`")
+    sub.add_parser("levels", help="print the level table")
+    p_allow = sub.add_parser("allow", help="add a CIDR to the whitelist")
+    p_allow.add_argument("cidr")
+    p_deny = sub.add_parser("deny", help="remove a CIDR from the whitelist")
+    p_deny.add_argument("cidr")
+    sub.add_parser("check", help="diagnostics")
+    sub.add_parser("setup", help="add the conf.d include to nginx.conf if missing")
+    return parser
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "set": cmd_set,
+    "up": cmd_up,
+    "down": cmd_down,
+    "off": cmd_off,
+    "levels": cmd_levels,
+    "allow": cmd_allow,
+    "deny": cmd_deny,
+    "check": cmd_check,
+    "setup": cmd_setup,
+}
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return EXIT_USAGE
+
+    out = Out(json_mode=args.json_mode, quiet=args.quiet)
+    try:
+        return COMMANDS[args.command](args, out)
+    except ToolError as exc:
+        if args.json_mode:
+            payload = {"error": exc.message, "exit_code": exc.code}
+            if exc.detail:
+                payload["detail"] = exc.detail
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print("nginx-ratelimit: %s" % exc.message, file=sys.stderr)
+            if exc.detail:
+                for key, value in sorted(exc.detail.items()):
+                    if value:
+                        print("  %s: %s" % (key, value), file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())
